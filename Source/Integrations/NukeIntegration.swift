@@ -13,77 +13,81 @@ import UIKit
 import Nuke
 
 class NukeIntegration: NSObject, AXNetworkIntegrationProtocol {
+    public weak var delegate: AXNetworkIntegrationDelegate?
 
-    weak public var delegate: AXNetworkIntegrationDelegate?
+    fileprivate var retrieveImageTasks
+        = NSMapTable<AXPhotoProtocol, ImageTask>(keyOptions: .strongMemory, valueOptions: .strongMemory)
 
-    fileprivate var retrieveImageTasks = NSMapTable<AXPhotoProtocol, ImageTask>(keyOptions: .strongMemory, valueOptions: .strongMemory)
+    func executeInBackground(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            DispatchQueue.global().async(execute: block)
+        } else {
+            block()
+        }
+    }
+
+    typealias Progress = (_ response: ImageResponse?, _ completed: Int64, _ total: Int64) -> Void
+    typealias Completion = (_ result: Result<ImageResponse, ImagePipeline.Error>) -> Void
 
     public func loadPhoto(_ photo: AXPhotoProtocol) {
         if photo.imageData != nil || photo.image != nil {
-            AXDispatchUtils.executeInBackground { [weak self] in
-                guard let `self` = self else { return }
+            executeInBackground { [weak self] in
+                guard let self = self else { return }
                 self.delegate?.networkIntegration(self, loadDidFinishWith: photo)
             }
             return
         }
 
         guard let url = photo.url else { return }
-        
-        let progress: ImageTask.ProgressHandler = { [weak self] (_, receivedSize, totalSize) in
-            AXDispatchUtils.executeInBackground { [weak self] in
-                guard let `self` = self else { return }
-                self.delegate?.networkIntegration?(self, didUpdateLoadingProgress: CGFloat(receivedSize) / CGFloat(totalSize), for: photo)
+
+        let progress: Progress = { [weak self] _, receivedSize, totalSize in
+            self?.executeInBackground { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.networkIntegration?(
+                    self, didUpdateLoadingProgress: CGFloat(receivedSize) / CGFloat(totalSize),
+                    for: photo
+                )
             }
         }
-        
-        let completion: ImageTask.Completion = { [weak self] (response, error) in
-            guard let `self` = self else { return }
-            
+
+        let completion: Completion = { [weak self] response in
+            guard let self = self else { return }
+
             self.retrieveImageTasks.removeObject(forKey: photo)
-            
-            if let imageData = response?.image.animatedImageData {
-                photo.imageData = imageData
-                AXDispatchUtils.executeInBackground { [weak self] in
-                    guard let `self` = self else { return }
+
+            switch response {
+            case let .success(result):
+                photo.image = result.image
+                self.executeInBackground { [weak self] in
+                    guard let self = self else { return }
                     self.delegate?.networkIntegration(self, loadDidFinishWith: photo)
                 }
-            } else if let image = response?.image {
-                photo.image = image
-                AXDispatchUtils.executeInBackground { [weak self] in
-                    guard let `self` = self else { return }
-                    self.delegate?.networkIntegration(self, loadDidFinishWith: photo)
-                }
-            } else {
-                let error = NSError(
-                    domain: AXNetworkIntegrationErrorDomain,
-                    code: AXNetworkIntegrationFailedToLoadErrorCode,
-                    userInfo: nil
-                )
-                AXDispatchUtils.executeInBackground { [weak self] in
-                    guard let `self` = self else { return }
+
+            case let .failure(error):
+                self.executeInBackground { [weak self] in
+                    guard let self = self else { return }
                     self.delegate?.networkIntegration(self, loadDidFailWith: error, for: photo)
                 }
             }
         }
-        
+
         let task = ImagePipeline.shared.loadImage(with: url, progress: progress, completion: completion)
-        self.retrieveImageTasks.setObject(task, forKey: photo)
+        retrieveImageTasks.setObject(task, forKey: photo)
     }
 
     func cancelLoad(for photo: AXPhotoProtocol) {
-        guard let downloadTask = self.retrieveImageTasks.object(forKey: photo) else { return }
+        guard let downloadTask = retrieveImageTasks.object(forKey: photo) else { return }
         downloadTask.cancel()
     }
 
     func cancelAllLoads() {
-        let enumerator = self.retrieveImageTasks.objectEnumerator()
+        let enumerator = retrieveImageTasks.objectEnumerator()
 
         while let downloadTask = enumerator?.nextObject() as? ImageTask {
             downloadTask.cancel()
         }
 
-        self.retrieveImageTasks.removeAllObjects()
+        retrieveImageTasks.removeAllObjects()
     }
-
 }
 #endif
